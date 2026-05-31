@@ -2,7 +2,7 @@
 
 将 Rokid AR 眼镜通过灵珠平台（Rizon）接入 [Hermes Agent](https://github.com/nousresearch/hermes-agent)，实现眼镜语音对话。
 
-![Demo: Hermes on Rokid Glasses](images/demo-in-car.jpg)
+<img src="images/demo-in-car.jpg" width="50%" alt="Demo: Hermes on Rokid Glasses">
 
 > 实拍：开车时通过 Rokid 眼镜与 Hermes 语音对话，HUD 实时显示 AI 回复
 
@@ -53,7 +53,7 @@ python src/main.py
 3. URL 填 `https://your-domain.com/api/sse`
 4. 鉴权方式选 Bearer Token，AK 填你 .env 中的 `ROKID_AK`
 
-![灵珠平台配置示例](images/lingzhu-config.jpg)
+<img src="images/lingzhu-config.jpg" width="50%" alt="灵珠平台配置示例">
 
 ⚠️ **不要点击「提审」**，未提审的智能体只有自己能用。
 
