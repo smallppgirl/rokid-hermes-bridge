@@ -27,13 +27,12 @@ import asyncio
 import logging
 import time
 import httpx
-from collections import defaultdict
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import StreamingResponse, JSONResponse
-from typing import Optional, Union, Dict, List
+from typing import Optional, Union
 from dotenv import load_dotenv
-from session_store import store_conversation
+
 
 # 可选：记忆提取（设 ENABLE_MEMORY_EXTRACTOR=true 启用）
 _memory_extractor = None
@@ -54,7 +53,7 @@ HERMES_GATEWAY_URL = os.getenv("HERMES_GATEWAY_URL", "http://localhost:8642")
 HERMES_MODEL = os.getenv("HERMES_MODEL", "mimo-v2.5")
 HERMES_API_KEY = os.getenv("HERMES_API_KEY", "").strip()  # Gateway API key
 MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
-MAX_HISTORY_ROUNDS = 5            # 保留最近 5 轮对话（10 条消息）
+
 SSE_HEARTBEAT_INTERVAL = 30       # SSE 心跳间隔（秒）
 MAX_RETRIES = 1                   # Gateway 失败重试次数
 
@@ -92,28 +91,6 @@ async def lifespan(app):
 
 app = FastAPI(title="Rokid → Hermes Bridge", lifespan=lifespan)
 
-# 按 user_id 隔离对话历史
-_conversation_history: Dict[str, List[dict]] = defaultdict(list)
-
-
-def get_history(user_id: str) -> list:
-    return _conversation_history[user_id]
-
-
-def add_to_history(user_id: str, role: str, content):
-    """添加消息到历史，超过限制自动丢弃最早的"""
-    history = _conversation_history[user_id]
-    history.append({"role": role, "content": content})
-    max_messages = MAX_HISTORY_ROUNDS * 2
-    while len(history) > max_messages:
-        history.pop(0)
-
-
-def clear_history(user_id: str):
-    """清空用户对话历史"""
-    _conversation_history.pop(user_id, None)
-
-
 # ── 语音适配：去除 markdown 格式 ───────────────
 def strip_markdown_for_voice(text: str) -> str:
     if not text:
@@ -142,8 +119,7 @@ async def health():
     return {
         "status": "ok",
         "service": "hermes-bridge",
-        "version": "2.0.0",
-        "active_sessions": len(_conversation_history),
+        "version": "3.0.0",
     }
 
 
@@ -250,19 +226,23 @@ def build_context_from_metadata(metadata: dict) -> str:
 
 
 # ── 带重试和心跳的 Gateway 流式调用 ──────────
-async def call_gateway_with_retry(messages: list, message_id: str, agent_id: str):
+async def call_gateway_with_retry(messages: list, message_id: str, agent_id: str, session_id: str = ""):
     last_error = None
     for attempt in range(1 + MAX_RETRIES):
         try:
             client = await get_client()
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {HERMES_API_KEY}" if HERMES_API_KEY else "",
+            }
+            if session_id:
+                headers["X-Hermes-Session-Id"] = session_id
+
             async with client.stream(
                 "POST",
                 f"{HERMES_GATEWAY_URL}/v1/chat/completions",
                 json={"model": HERMES_MODEL, "messages": messages, "stream": True},
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {HERMES_API_KEY}" if HERMES_API_KEY else "",
-                },
+                headers=headers,
             ) as response:
                 if response.status_code != 200:
                     error_text = await response.aread()
@@ -360,15 +340,20 @@ async def rokid_sse(
         txt_preview = next((p["text"][:50] for p in user_content if p.get("type") == "text"), "")
         logger.info(f"用户[{user_id}]: {img_count}张图片, 文本={txt_preview}, message_id={message_id}")
 
-    # 检查清除上下文指令
+    # 生成 session_id，由 Gateway 统一管理历史和 token 统计
+    from datetime import datetime
+    session_id = f"rokid:{user_id}:{datetime.now().strftime('%Y%m%d')}"
+
+    # 检查清除上下文指令 → 生成新 session_id 让 Gateway 开新会话
     if isinstance(user_content, str):
         clear_keywords = ["清除记忆", "重新开始", "清空对话", "忘记之前"]
         for kw in clear_keywords:
             if kw in user_content:
-                clear_history(user_id)
-                logger.info(f"用户[{user_id}] 清除了对话历史")
+                session_id = f"rokid:{user_id}:{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                logger.info(f"用户[{user_id}] 清除对话历史，新 session: {session_id}")
+                break
 
-    # 构建消息列表
+    # 构建消息列表（只发 system prompt + 当前消息，历史由 Gateway 从 state.db 加载）
     messages = []
     metadata = body.get("metadata", {})
     context_info = build_context_from_metadata(metadata)
@@ -378,18 +363,14 @@ async def rokid_sse(
         system_parts.append(f"[设备信息]\n{context_info}")
 
     messages.append({"role": "system", "content": "\n\n".join(system_parts)})
-
-    history = get_history(user_id)
-    messages.extend(history)
     messages.append({"role": "user", "content": user_content})
-    add_to_history(user_id, "user", user_content)
 
     async def event_stream():
         yield ": keepalive\n\n"
         full_response = ""
 
         try:
-            async for sse_chunk, is_heartbeat in call_gateway_with_retry(messages, message_id, agent_id):
+            async for sse_chunk, is_heartbeat in call_gateway_with_retry(messages, message_id, agent_id, session_id):
                 if not is_heartbeat:
                     try:
                         data_line = sse_chunk.split("data:", 1)[1].strip()
@@ -401,24 +382,14 @@ async def rokid_sse(
                         pass
                 yield sse_chunk
 
-            if full_response:
-                add_to_history(user_id, "assistant", full_response)
-
-            # 异步写入 Hermes session DB
-            user_text_preview = ""
-            if isinstance(user_content, str):
-                user_text_preview = user_content
-            elif isinstance(user_content, list):
-                user_text_preview = next((p["text"] for p in user_content if p.get("type") == "text"), "")
-
-            if user_text_preview and full_response:
-                asyncio.create_task(store_conversation(
-                    user_id=user_id, user_msg=user_text_preview,
-                    assistant_msg=full_response, model=HERMES_MODEL,
-                ))
-
-                # 可选：记忆提取
-                if _memory_extractor:
+            # 可选：记忆提取
+            if full_response and _memory_extractor:
+                user_text_preview = ""
+                if isinstance(user_content, str):
+                    user_text_preview = user_content
+                elif isinstance(user_content, list):
+                    user_text_preview = next((p["text"] for p in user_content if p.get("type") == "text"), "")
+                if user_text_preview:
                     asyncio.create_task(_memory_extractor(
                         user_msg=user_text_preview,
                         assistant_msg=full_response,
@@ -450,7 +421,7 @@ if __name__ == "__main__":
     logger.info(f"🚀 Rokid → Hermes Bridge 启动 on port {PORT}")
     logger.info(f"   Gateway: {HERMES_GATEWAY_URL}")
     logger.info(f"   Model: {HERMES_MODEL}")
-    logger.info(f"   多轮上下文: 最近 {MAX_HISTORY_ROUNDS} 轮")
+    logger.info(f"   Session 管理: Gateway 统一管理（X-Hermes-Session-Id）")
     logger.info(f"   SSE 心跳: {SSE_HEARTBEAT_INTERVAL}s")
     logger.info(f"   重试次数: {MAX_RETRIES}")
     logger.info(f"   记忆提取: {'启用' if _memory_extractor else '禁用'}")
