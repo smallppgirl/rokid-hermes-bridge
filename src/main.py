@@ -57,6 +57,22 @@ MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
 SSE_HEARTBEAT_INTERVAL = 30       # SSE 心跳间隔（秒）
 MAX_RETRIES = 1                   # Gateway 失败重试次数
 
+# 视觉意图 → 触发眼镜拍照（take_photo）
+VISION_PATTERNS = [
+    "看看", "看一下", "看一眼", "看前面", "看下", "识别", "认一下",
+    "这是什么", "这是啥", "什么牌", "牌子", "上面写", "眼前",
+    "帮我看看", "帮我识别", "分析", "前面是什么", "拍一下",
+]
+
+
+def _is_vision_request(text: str) -> bool:
+    if not text:
+        return False
+    for _p in VISION_PATTERNS:
+        if _p in text:
+            return True
+    return False
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("rokid-bridge")
 
@@ -266,16 +282,24 @@ async def call_gateway_with_retry(messages: list, message_id: str, agent_id: str
 
                     try:
                         chunk = json.loads(data_str)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content:
-                            last_content_time = now
-                            yield format_lingzhu_sse({
-                                "role": "agent", "type": "answer", "answer_stream": content,
-                                "message_id": message_id, "agent_id": agent_id, "is_finish": False,
-                            }), False
                     except json.JSONDecodeError:
                         continue
+                    # 容错：某些 SSE 行不是标准 choices 结构（如 tool.progress / 纯字符串），跳过别报错
+                    if not isinstance(chunk, dict):
+                        continue
+                    choices = chunk.get("choices")
+                    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    if not isinstance(delta, dict):
+                        continue
+                    content = delta.get("content")
+                    if content:
+                        last_content_time = now
+                        yield format_lingzhu_sse({
+                            "role": "agent", "type": "answer", "answer_stream": content,
+                            "message_id": message_id, "agent_id": agent_id, "is_finish": False,
+                        }), False
             return
         except Exception as e:
             last_error = e
@@ -302,6 +326,7 @@ VOICE_SYSTEM_PROMPT = """你是一个通过 AR 眼镜语音交互的 AI 助手�
 5. 如果有图片，直接描述你看到的内容，不要说"我看到您发送了一张图片"
 6. 保持自然对话的语气，像朋友聊天一样
 7. 用户的输入来自语音识别（STT），可能包含错别字或误识别。遇到明显不通顺或不合理的内容时，请根据上下文推测用户的真实意图，自然地回答，不要指出识别错误或反问"你是不是想说XXX"
+8. 始终使用与用户输入相同的语言回复：用户说英文你就用英文，用户说中文就用中文。尤其是当语言上下文（如"语言: en-US"）给出时，优先遵循它。
 """
 
 
@@ -332,6 +357,23 @@ async def rokid_sse(
         return JSONResponse({"error": "empty text"}, status_code=400)
     elif isinstance(user_content, list) and len(user_content) == 0:
         return JSONResponse({"error": "empty content"}, status_code=400)
+
+    # 视觉意图且当前文本无图 → 转成 take_photo，让眼镜拍一张再回传识别
+    if isinstance(user_content, str) and _is_vision_request(user_content):
+        logger.info(f"take_photo trigger: {user_content[:60]}, message_id={message_id}")
+
+        def _take_photo_stream():
+            yield format_lingzhu_sse({
+                "role": "agent", "type": "tool_call",
+                "tool_call": {"command": "take_photo"},
+                "message_id": message_id, "agent_id": agent_id, "is_finish": False,
+            })
+            yield format_lingzhu_sse({
+                "role": "agent", "type": "tool_call",
+                "message_id": message_id, "agent_id": agent_id, "is_finish": True,
+            })
+
+        return StreamingResponse(_take_photo_stream(), media_type="text/event-stream")
 
     if isinstance(user_content, str):
         logger.info(f"用户[{user_id}]: {user_content[:100]}, message_id={message_id}")
