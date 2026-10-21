@@ -57,21 +57,8 @@ MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
 SSE_HEARTBEAT_INTERVAL = 30       # SSE 心跳间隔（秒）
 MAX_RETRIES = 1                   # Gateway 失败重试次数
 
-# 视觉意图 → 触发眼镜拍照（take_photo）
-VISION_PATTERNS = [
-    "看看", "看一下", "看一眼", "看前面", "看下", "识别", "认一下",
-    "这是什么", "这是啥", "什么牌", "牌子", "上面写", "眼前",
-    "帮我看看", "帮我识别", "分析", "前面是什么", "拍一下",
-]
-
-
-def _is_vision_request(text: str) -> bool:
-    if not text:
-        return False
-    for _p in VISION_PATTERNS:
-        if _p in text:
-            return True
-    return False
+# 视觉意图 → 触发眼镜拍照（take_photo），判断见 vision_intent.py
+from vision_intent import is_vision_request as _is_vision_request
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("rokid-bridge")
