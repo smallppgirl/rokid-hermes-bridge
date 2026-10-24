@@ -58,7 +58,12 @@ SSE_HEARTBEAT_INTERVAL = 30       # SSE 心跳间隔（秒）
 MAX_RETRIES = 1                   # Gateway 失败重试次数
 
 # 视觉意图 → 触发眼镜拍照（take_photo），判断见 vision_intent.py
-from vision_intent import is_vision_request as _is_vision_request
+# 两种启动方式都要能导入：python src/main.py（src 在 sys.path 上）
+# 和在仓库根目录 uvicorn src.main:app（src 是包）
+try:
+    from vision_intent import is_vision_request as _is_vision_request
+except ImportError:
+    from src.vision_intent import is_vision_request as _is_vision_request
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("rokid-bridge")
