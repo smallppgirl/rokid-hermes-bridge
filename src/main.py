@@ -169,6 +169,26 @@ async def download_image_as_base64(url: str) -> Optional[str]:
         return None
 
 
+# ── 眼镜拍的照片：记录大小，并把最近一张存到 logs/ 方便排查 ──
+# 2016x1512 的 JPEG 正常有几百 KB；全黑的只有几十 KB
+LAST_PHOTO_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+
+
+def _note_photo(data_url: str) -> None:
+    try:
+        header, b64 = data_url.split(",", 1)
+        data = base64.b64decode(b64)
+        mime = header[5:].split(";")[0] or "image/jpeg"
+        ext = {"image/png": "png", "image/webp": "webp"}.get(mime, "jpg")
+        os.makedirs(LAST_PHOTO_DIR, exist_ok=True)
+        path = os.path.join(LAST_PHOTO_DIR, f"last_photo.{ext}")
+        with open(path, "wb") as f:
+            f.write(data)
+        logger.info(f"照片: {mime}, {len(data) // 1024} KB, 已存 {path}")
+    except Exception as e:
+        logger.warning(f"照片记录失败: {e}")
+
+
 # ── 构建用户消息内容（支持文本+图片）──────────
 async def build_user_content(body: dict) -> Union[str, list]:
     raw_messages = body.get("message", [])
@@ -196,6 +216,7 @@ async def build_user_content(body: dict) -> Union[str, list]:
                         image_parts.append({"type": "image_url", "image_url": {"url": data_url}})
                         logger.info(f"图片已下载并转 base64: {len(data_url)} chars")
                 elif image_url.startswith("data:"):
+                    _note_photo(image_url)
                     image_parts.append({"type": "image_url", "image_url": {"url": image_url}})
 
     if not image_parts:
